@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 ARG KOMODO_PERIPHERY_VERSION
 
-FROM ghcr.io/moghtech/komodo-periphery:${KOMODO_PERIPHERY_VERSION:-latest}
+FROM ghcr.io/moghtech/komodo-periphery:${KOMODO_PERIPHERY_VERSION:-2}
 
 USER root
 
