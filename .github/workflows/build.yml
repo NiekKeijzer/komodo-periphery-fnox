@@ -1,0 +1,402 @@
+name: Create komodo-periphery image including fnox
+
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - Dockerfile*
+      - .dockerignore
+      - .github/workflows/build.yml
+
+  pull_request:
+    branches: ["main"]
+    paths:
+      - Dockerfile*
+      - .dockerignore
+      - .github/workflows/build.yml
+
+
+  schedule:
+    - cron: "00 3 * * *" # daily 03:00 UTC
+
+
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force build even if no upstream changes are detected"
+        required: false
+        default: "false"
+
+
+permissions:
+  contents: read
+  packages: write
+
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Classify local changes
+        id: local_changes
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_SHA: ${{ github.sha }}
+          WORKFLOW_PATH: .github/workflows/build.yml
+        run: |
+          set -euo pipefail
+
+          image_inputs_changed=false
+          workflow_changed=false
+          changed_files=""
+          compare_from=""
+          compare_to=""
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            compare_from="$PR_BASE_SHA"
+            compare_to="$PR_HEAD_SHA"
+          elif [ "$EVENT_NAME" = "push" ]; then
+            compare_from="$PUSH_BEFORE_SHA"
+            compare_to="$PUSH_SHA"
+          fi
+
+          if [ -n "$compare_from" ] && [ -n "$compare_to" ] && [ "$compare_from" != "0000000000000000000000000000000000000000" ]; then
+            changed_files="$(git diff --name-only "$compare_from" "$compare_to" || true)"
+          fi
+
+          if printf '%s\n' "$changed_files" | grep -Eq '^(Dockerfile[^/]*|\.dockerignore)$'; then
+            image_inputs_changed=true
+          fi
+
+          if printf '%s\n' "$changed_files" | grep -Fxq "$WORKFLOW_PATH"; then
+            workflow_changed=true
+          fi
+
+          echo "image_inputs_changed=$image_inputs_changed" >> "$GITHUB_OUTPUT"
+          echo "workflow_changed=$workflow_changed" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup crane
+        uses: imjasonh/setup-crane@v0.6
+
+      - name: Determine optional registry targets
+        id: registries
+        shell: bash
+        env:
+          REPOSITORY_NAME: ${{ github.event.repository.name }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+        run: |
+          set -euo pipefail
+
+          ghcr_image="ghcr.io/${{ github.repository_owner }}/${REPOSITORY_NAME}"
+          echo "ghcr_image=${ghcr_image}" >> "$GITHUB_OUTPUT"
+
+          if [ -n "${DOCKERHUB_USERNAME:-}" ] && [ -n "${DOCKERHUB_TOKEN:-}" ]; then
+            dockerhub_repo="${DOCKERHUB_REPOSITORY:-${DOCKERHUB_USERNAME}/${REPOSITORY_NAME}}"
+            echo "dockerhub_enabled=true" >> "$GITHUB_OUTPUT"
+            echo "dockerhub_image=${dockerhub_repo}" >> "$GITHUB_OUTPUT"
+          else
+            echo "dockerhub_enabled=false" >> "$GITHUB_OUTPUT"
+            echo "dockerhub_image=" >> "$GITHUB_OUTPUT"
+          fi
+
+
+      - name: Decide whether to build (base OR fnox) + build reason
+        id: decide
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          BASE="ghcr.io/moghtech/komodo-periphery:latest"
+          IMAGE="${{ steps.registries.outputs.ghcr_image }}"
+
+          GH_API="https://api.github.com"
+          AUTH_HEADER="Authorization: Bearer ${GH_TOKEN}"
+
+          # Always compute "selected" versions/digest for this run
+          BASE_DIGEST="$(crane digest "$BASE")"
+
+          # Determine periphery x.y.z tag that matches the selected BASE digest
+          BASE_CFG="$(crane config "$BASE")"
+
+          # Try common version labels from the base image
+          PERIPHERY_TAG_RAW="$(echo "$BASE_CFG" | jq -r '.config.Labels["org.opencontainers.image.version"] // .config.Labels["org.label-schema.version"] // ""')"
+          PERIPHERY_TAG="${PERIPHERY_TAG_RAW#v}"
+
+          is_semver() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+
+          if ! is_semver "$PERIPHERY_TAG"; then
+            PERIPHERY_TAG=""
+
+            # Fallback: scan tags, keep only x.y.z, compare digest
+            # NOTE: This can take a bit if there are many tags, but is reliable.
+            mapfile -t tags < <(crane ls ghcr.io/moghtech/komodo-periphery | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true)
+
+            # Prefer newest first by version sort
+            if [ "${#tags[@]}" -gt 0 ]; then
+              mapfile -t tags_sorted < <(printf '%s\n' "${tags[@]}" | sort -V -r)
+
+              for t in "${tags_sorted[@]}"; do
+                d="$(crane digest "ghcr.io/moghtech/komodo-periphery:${t}")"
+                if [ "$d" = "$BASE_DIGEST" ]; then
+                  PERIPHERY_TAG="$t"
+                  break
+                fi
+              done
+            fi
+          fi
+
+          if [ -z "$PERIPHERY_TAG" ]; then
+            echo "ERROR: Could not resolve periphery x.y.z tag for digest ${BASE_DIGEST}" >&2
+            exit 1
+          fi
+
+          IFS='.' read -r PERIPHERY_MAJOR PERIPHERY_MINOR _ <<< "$PERIPHERY_TAG"
+          PERIPHERY_MAJOR_TAG="${PERIPHERY_MAJOR}"
+          PERIPHERY_MINOR_TAG="${PERIPHERY_MAJOR}.${PERIPHERY_MINOR}"
+          CURRENT_IMAGE="${IMAGE}:${PERIPHERY_MAJOR_TAG}"
+
+          {
+            echo "periphery_tag=$PERIPHERY_TAG"
+            echo "periphery_major_tag=$PERIPHERY_MAJOR_TAG"
+            echo "periphery_minor_tag=$PERIPHERY_MINOR_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+          FNOX_TAG="$(curl -fsSL -H "$AUTH_HEADER" -H "Accept: application/vnd.github+json"             "${GH_API}/repos/jdx/fnox/releases/latest" | jq -r '.tag_name')"
+
+          FNOX_VERSION="${FNOX_TAG#v}"
+
+          FNOX_RELEASE_URL="https://github.com/jdx/fnox/releases/tag/${FNOX_TAG}"
+
+          {
+            echo "base_digest=$BASE_DIGEST"
+            echo "fnox_version=$FNOX_VERSION"
+            echo "fnox_release_url=$FNOX_RELEASE_URL"
+          } >> "$GITHUB_OUTPUT"
+
+          # Read "current" versions/digest from the published image (if it exists)
+          CURRENT_BASE_DIGEST=""
+          CURRENT_BASE_VERSION=""
+          CURRENT_FNOX_VERSION=""
+
+          if crane manifest "$CURRENT_IMAGE" >/dev/null 2>&1; then
+            cfg="$(crane config "$CURRENT_IMAGE")"
+            CURRENT_BASE_DIGEST="$(echo "$cfg" | jq -r '.config.Labels["org.opencontainers.image.base.digest"] // ""')"
+            CURRENT_BASE_VERSION="$(echo "$cfg" | jq -r '.config.Labels["org.opencontainers.image.base.version"] // .config.Labels["org.opencontainers.image.base.tag"] // ""')"
+            CURRENT_FNOX_VERSION="$(echo "$cfg" | jq -r '.config.Labels["org.opencontainers.image.fnox.version"] // ""')"
+          fi
+
+          # Keep these as outputs (handy for debugging / future reuse)
+          {
+            echo "current_base_digest=$CURRENT_BASE_DIGEST"
+            echo "current_base_version=$CURRENT_BASE_VERSION"
+            echo "current_fnox_version=$CURRENT_FNOX_VERSION"
+          } >> "$GITHUB_OUTPUT"
+
+          # Determine forced build conditions
+          FORCED="false"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then
+            FORCED="true"
+          fi
+          if [ "${{ github.event_name }}" = "pull_request" ] && { [ "${{ steps.local_changes.outputs.image_inputs_changed }}" = "true" ] || [ "${{ steps.local_changes.outputs.workflow_changed }}" = "true" ]; }; then
+            FORCED="true"
+          fi
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ steps.local_changes.outputs.image_inputs_changed }}" = "true" ]; then
+            FORCED="true"
+          fi
+
+          # Detect upstream changes
+          CHANGED="false"
+          reasons=()
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "$FORCED" = "true" ]; then
+              reasons+=("Manual trigger (forced build)")
+            else
+              reasons+=("Manual trigger")
+            fi
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            if [ "${{ steps.local_changes.outputs.image_inputs_changed }}" = "true" ] && [ "${{ steps.local_changes.outputs.workflow_changed }}" = "true" ]; then
+              reasons+=("Pull request validation for image input and workflow changes")
+            elif [ "${{ steps.local_changes.outputs.image_inputs_changed }}" = "true" ]; then
+              reasons+=("Pull request validation for local image input changes")
+            elif [ "${{ steps.local_changes.outputs.workflow_changed }}" = "true" ]; then
+              reasons+=("Pull request validation for workflow changes")
+            else
+              reasons+=("Pull request validation")
+            fi
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            if [ "${{ steps.local_changes.outputs.image_inputs_changed }}" = "true" ] && [ "${{ steps.local_changes.outputs.workflow_changed }}" = "true" ]; then
+              reasons+=("Repository push changed local image inputs and workflow")
+            elif [ "${{ steps.local_changes.outputs.image_inputs_changed }}" = "true" ]; then
+              reasons+=("Repository push changed local image inputs")
+            elif [ "${{ steps.local_changes.outputs.workflow_changed }}" = "true" ]; then
+              reasons+=("Workflow changed, but no image input changed; publish skipped unless upstream changed")
+            else
+              reasons+=("Repository push")
+            fi
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            reasons+=("Scheduled upstream check")
+          fi
+
+          if [ -z "$CURRENT_BASE_DIGEST" ] || [ "$CURRENT_BASE_DIGEST" != "$BASE_DIGEST" ]; then
+            CHANGED="true"
+            reasons+=("komodo-periphery base changed: ${CURRENT_BASE_DIGEST:-(none)} -> ${BASE_DIGEST}")
+          fi
+
+          if [ "$CURRENT_FNOX_VERSION" != "$FNOX_VERSION" ]; then
+            CHANGED="true"
+            reasons+=("fnox updated: ${CURRENT_FNOX_VERSION:-(none)} -> ${FNOX_VERSION} ([release notes](${FNOX_RELEASE_URL}))")
+          fi
+
+          # Final decision
+          if [ "$FORCED" = "true" ] || [ "$CHANGED" = "true" ]; then
+            echo "do_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "do_build=false" >> "$GITHUB_OUTPUT"
+            reasons+=("No upstream changes detected (base/fnox unchanged)")
+          fi
+
+          # Single markdown blob for Job Summary
+          {
+            echo "reasons_md<<EOF"
+            echo "### Publish reason"
+            printf '%s\n' "${reasons[@]}" | sed 's/^/- /'
+            echo ""
+            echo "### Selected versions (this run)"
+            echo "- target image: ${IMAGE}"
+            echo "- komodo-periphery base channel: ${BASE}"
+            echo "- komodo-periphery digest: ${BASE_DIGEST}"
+            echo "- komodo-periphery tag: ${PERIPHERY_TAG}"
+            echo "- published tags: ${PERIPHERY_MAJOR_TAG}, ${PERIPHERY_MINOR_TAG}, ${PERIPHERY_TAG}"
+            echo "- fnox: ${FNOX_VERSION} (${FNOX_RELEASE_URL})"
+            echo ""
+            echo "### Current versions (published image)"
+            echo "- komodo-periphery digest: ${CURRENT_BASE_DIGEST:-(none)}"
+            echo "- komodo-periphery tag: ${CURRENT_BASE_VERSION:-(none)}"
+            echo "- fnox: ${CURRENT_FNOX_VERSION:-(none)}"
+            echo ""
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+
+      - name: Metadata
+        if: steps.decide.outputs.do_build == 'true'
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.registries.outputs.ghcr_image }}
+          tags: |
+            type=raw,value=${{ steps.decide.outputs.periphery_major_tag }}
+            type=raw,value=${{ steps.decide.outputs.periphery_minor_tag }}
+            type=raw,value=${{ steps.decide.outputs.periphery_tag }}
+
+
+      - name: Build and push
+        if: steps.decide.outputs.do_build == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.version=${{ steps.decide.outputs.periphery_tag }}
+            org.opencontainers.image.base.name=ghcr.io/moghtech/komodo-periphery
+            org.opencontainers.image.base.tag=${{ steps.decide.outputs.periphery_tag }}
+            org.opencontainers.image.base.digest=${{ steps.decide.outputs.base_digest }}
+            org.opencontainers.image.base.version=${{ steps.decide.outputs.periphery_tag }}
+            org.opencontainers.image.fnox.version=${{ steps.decide.outputs.fnox_version }}
+            org.opencontainers.image.description=Komodo periphery with fnox (auto rebuild on upstream updates)
+          build-args: |
+            KOMODO_PERIPHERY_VERSION=${{ steps.decide.outputs.periphery_tag }}
+            BASE_DIGEST=${{ steps.decide.outputs.base_digest }}
+            BASE_VERSION=${{ steps.decide.outputs.periphery_tag }}
+            FNOX_VERSION=${{ steps.decide.outputs.fnox_version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Login to Docker Hub
+        if: steps.decide.outputs.do_build == 'true' && github.event_name != 'pull_request' && steps.registries.outputs.dockerhub_enabled == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Mirror image to Docker Hub
+        if: steps.decide.outputs.do_build == 'true' && github.event_name != 'pull_request' && steps.registries.outputs.dockerhub_enabled == 'true'
+        id: dockerhub_mirror
+        shell: bash
+        env:
+          DOCKERHUB_IMAGE: ${{ steps.registries.outputs.dockerhub_image }}
+          PERIPHERY_MAJOR_TAG: ${{ steps.decide.outputs.periphery_major_tag }}
+          PERIPHERY_MINOR_TAG: ${{ steps.decide.outputs.periphery_minor_tag }}
+          PERIPHERY_TAG: ${{ steps.decide.outputs.periphery_tag }}
+        run: |
+          set -euo pipefail
+
+          src_base="${{ steps.registries.outputs.ghcr_image }}"
+          dst_base="${DOCKERHUB_IMAGE}"
+
+          for tag in "${PERIPHERY_MAJOR_TAG}" "${PERIPHERY_MINOR_TAG}" "${PERIPHERY_TAG}"; do
+            crane copy "${src_base}:${tag}" "${dst_base}:${tag}"
+          done
+
+      - name: Write build summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            printf '%s\n' "${{ steps.decide.outputs.reasons_md }}"
+            printf '\n### Image\n'
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              printf -- "- Validation build only. No image was pushed.\n"
+            else
+              printf -- "- \`${{ steps.registries.outputs.ghcr_image }}:${{ steps.decide.outputs.periphery_major_tag }}\`\n"
+              printf -- "- \`${{ steps.registries.outputs.ghcr_image }}:${{ steps.decide.outputs.periphery_minor_tag }}\`\n"
+              printf -- "- \`${{ steps.registries.outputs.ghcr_image }}:${{ steps.decide.outputs.periphery_tag }}\`\n"
+            fi
+            printf '\n### Docker Hub Mirror\n'
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              printf -- "- Skipped for pull request validation.\n"
+            elif [ "${{ steps.registries.outputs.dockerhub_enabled }}" != "true" ]; then
+              printf -- "- Skipped: set \`DOCKERHUB_USERNAME\` and \`DOCKERHUB_TOKEN\` repository secrets to enable Docker Hub publishing.\n"
+            elif [ "${{ steps.decide.outputs.do_build }}" != "true" ]; then
+              printf -- "- No image build was required, so Docker Hub was not updated.\n"
+            elif [ "${{ steps.dockerhub_mirror.outcome }}" = "success" ]; then
+              printf -- "- \`${{ steps.registries.outputs.dockerhub_image }}:${{ steps.decide.outputs.periphery_major_tag }}\`\n"
+              printf -- "- \`${{ steps.registries.outputs.dockerhub_image }}:${{ steps.decide.outputs.periphery_minor_tag }}\`\n"
+              printf -- "- \`${{ steps.registries.outputs.dockerhub_image }}:${{ steps.decide.outputs.periphery_tag }}\`\n"
+            else
+              printf -- "- Mirror was attempted but did not complete successfully.\n"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
