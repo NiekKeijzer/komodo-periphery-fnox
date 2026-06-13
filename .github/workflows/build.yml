@@ -113,11 +113,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          ghcr_image="ghcr.io/${{ github.repository_owner }}/${REPOSITORY_NAME}"
+          # Image references must be lowercase; GitHub usernames/orgs may contain uppercase letters
+          owner_lc="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          repo_lc="$(echo "${REPOSITORY_NAME}" | tr '[:upper:]' '[:lower:]')"
+
+          ghcr_image="ghcr.io/${owner_lc}/${repo_lc}"
           echo "ghcr_image=${ghcr_image}" >> "$GITHUB_OUTPUT"
 
           if [ -n "${DOCKERHUB_USERNAME:-}" ] && [ -n "${DOCKERHUB_TOKEN:-}" ]; then
-            dockerhub_repo="${DOCKERHUB_REPOSITORY:-${DOCKERHUB_USERNAME}/${REPOSITORY_NAME}}"
+            dockerhub_user_lc="$(echo "${DOCKERHUB_USERNAME}" | tr '[:upper:]' '[:lower:]')"
+            dockerhub_repo="${DOCKERHUB_REPOSITORY:-${dockerhub_user_lc}/${repo_lc}}"
             echo "dockerhub_enabled=true" >> "$GITHUB_OUTPUT"
             echo "dockerhub_image=${dockerhub_repo}" >> "$GITHUB_OUTPUT"
           else
@@ -134,7 +139,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          BASE="ghcr.io/moghtech/komodo-periphery:latest"
+          BASE="ghcr.io/moghtech/komodo-periphery:2"
           IMAGE="${{ steps.registries.outputs.ghcr_image }}"
 
           GH_API="https://api.github.com"
