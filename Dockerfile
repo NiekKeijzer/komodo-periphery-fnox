@@ -1,7 +1,5 @@
 # syntax=docker/dockerfile:1
-ARG KOMODO_PERIPHERY_VERSION
-
-FROM ghcr.io/moghtech/komodo-periphery:${KOMODO_PERIPHERY_VERSION:-2}
+FROM ghcr.io/moghtech/komodo-periphery:2.3.4@sha256:fb4b52961fcce7a31e3776930e422967b6640f653de876f59f26dea243e29beb
 
 USER root
 
@@ -17,7 +15,8 @@ RUN set -eux; \
 	fi
 
 ARG TARGETARCH
-ARG FNOX_VERSION
+# renovate: datasource=github-releases depName=jdx/fnox extractVersion=^v(?<version>.*)$
+ARG FNOX_VERSION=1.46.0
 ARG BASE_DIGEST=""
 ARG BASE_VERSION=""
 

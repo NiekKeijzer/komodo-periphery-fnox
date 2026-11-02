@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/NiekKeijzer/komodo-periphery-fnox/actions/workflows/build.yml/badge.svg)](https://github.com/NiekKeijzer/komodo-periphery-fnox/actions)
 
-A [Komodo](https://github.com/moghtech/komodo) Periphery image with [fnox](https://github.com/jdx/fnox) preinstalled, published to GHCR and rebuilt automatically when the base image or fnox release changes.
+A [Komodo](https://github.com/moghtech/komodo) Periphery image with [fnox](https://github.com/jdx/fnox) preinstalled, published to GHCR. Both versions are pinned in the [Dockerfile](./Dockerfile) and kept up to date by [Renovate](https://docs.renovatebot.com/); every merged update rebuilds and publishes the image.
 
 ## Image
 
@@ -25,11 +25,10 @@ services:
 ## Building locally
 
 ```bash
-docker build \
-  --build-arg KOMODO_PERIPHERY_VERSION=2.0.0 \
-  --build-arg FNOX_VERSION=1.26.0 \
-  -t komodo-periphery-fnox .
+docker build -t komodo-periphery-fnox .
 ```
+
+This uses the versions pinned in the Dockerfile. To try another fnox release, add `--build-arg FNOX_VERSION=<version>`.
 
 ## Credits
 
