@@ -4,6 +4,7 @@
     "config:recommended",
     "customManagers:dockerfileVersions"
   ],
+  "reviewers": ["NiekKeijzer"],
   "packageRules": [
     {
       "description": "Merging rebuilds and publishes the image, so a passing build is enough. Majors (e.g. periphery 3.x) wait for review.",
