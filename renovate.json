@@ -1,6 +1,14 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended"
+    "config:recommended",
+    "customManagers:dockerfileVersions"
+  ],
+  "packageRules": [
+    {
+      "description": "Merging rebuilds and publishes the image, so a passing build is enough. Majors (e.g. periphery 3.x) wait for review.",
+      "matchUpdateTypes": ["minor", "patch", "digest"],
+      "automerge": true
+    }
   ]
 }
