@@ -40,10 +40,6 @@ This uses the versions pinned in the Dockerfile. To try another fnox release, ad
 
 Based on [smoochy/komodo-periphery-sops-age](https://github.com/smoochy/komodo-periphery-sops-age), adapted to install [fnox](https://github.com/jdx/fnox) instead of SOPS/age.
 
-## AI disclaimer
-
-The Dockerfile, workflow, and this README were drafted with AI assistance (Claude) and reviewed before publishing.
-
 ## License
 
 [MIT](./LICENSE)
