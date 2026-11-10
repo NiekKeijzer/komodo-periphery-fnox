@@ -16,7 +16,7 @@ RUN set -eux; \
 
 ARG TARGETARCH
 # renovate: datasource=github-releases depName=jdx/fnox extractVersion=^v(?<version>.*)$
-ARG FNOX_VERSION=1.47.0
+ARG FNOX_VERSION=1.48.0
 ARG BASE_DIGEST=""
 ARG BASE_VERSION=""
 
